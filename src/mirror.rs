@@ -1,13 +1,13 @@
-use std::{fmt::Display, mem, str::FromStr, sync::Arc};
+use std::{fmt::Display, mem, time::Duration};
 
-use ahash::{HashMap, HashSet, HashSetExt};
-use indicatif::HumanBytes;
+use ahash::{HashSet, HashSetExt};
+use compact_str::{CompactString, ToCompactString};
+use indicatif::{HumanBytes, MultiProgress, ProgressBar};
 use nodejs_semver::{Range, Version};
-use serde_json::{Map, Value};
-use tokio::{fs::read_to_string, sync::RwLock};
+use tokio::{fs::read_to_string, task::JoinHandle, time::sleep};
 use walkdir::WalkDir;
 
-use crate::{downloader::{Download, Downloader}, error::{ErrorKind, NpmError}, log, metadata::{local_metadata_path, manifest::Manifest}, CliOpts};
+use crate::{downloader::{Download, Downloader}, error::{ErrorKind, NpmError}, log, metadata::{manifest::Manifest, package_index::{read_package_idx, IdxDep, IdxDepVersion, PackageIndex}}, progress::Progress, range_cache::PackageRangeCache, CliOpts};
 
 pub struct MirrorResult {
     new_packages: u64,
@@ -23,83 +23,87 @@ impl Display for MirrorResult {
 pub async fn mirror(opts: &CliOpts, downloader: Downloader) -> Result<MirrorResult, NpmError> {
     let range_cache = PackageRangeCache::default();
 
+    let mut buf: Vec<u8> = vec![0u8; 1024*8];
+
     downloader.progress().set_total_steps(3);
-    downloader.progress().next_step("Getting metadata").await;
+    downloader.progress().next_step("Direct deps").await;
 
     download_metadata(opts, &downloader, &range_cache).await
-        .map_err(NpmError::DownloadingDependencies)?;
+        .map_err(NpmError::Dependencies)?;
 
-    downloader.progress().next_step("Getting child metadata").await;
+    downloader.progress().next_step("Descendants").await;
 
-    download_child_metadata(opts, &downloader, &range_cache).await
-        .map_err(NpmError::DownloadingChildDependencies)?;
+    download_child_metadata(&mut buf, opts, &downloader, &range_cache).await
+        .map_err(NpmError::ChildDependencies)?;
     
-    downloader.progress().next_step("Downloading packages").await;
+    downloader.progress().next_step("Packages").await;
 
-    let result = download_packages(opts, &downloader, &range_cache).await
-        .map_err(NpmError::DownloadingPackages)?;
+    let result = download_packages(&mut buf, opts, &downloader, &range_cache).await
+        .map_err(NpmError::Packages)?;
 
     // TODO: add step to remove non-existing versions from index.json-files
 
     Ok(result)
 }
 
-async fn download_packages(opts: &CliOpts, downloader: &Downloader, range_cache: &PackageRangeCache) -> Result<MirrorResult, ErrorKind> {
-    let mut progress_bar = downloader.progress().create_download_progress_bar().await;
+async fn download_packages(buf: &mut Vec<u8>, opts: &CliOpts, downloader: &Downloader, range_cache: &PackageRangeCache) -> Result<MirrorResult, ErrorKind> {
+    let multi_bar = MultiProgress::new();
+
+    let proc_progress = Progress::with_step("Processing");
+
+    let proc_pb = multi_bar.add(proc_progress.create_processing_progress_bar().await);
+    let dl_pb = multi_bar.add(downloader.progress().create_download_progress_bar().await);
+    
+    let _updater = spawn_updater(vec![
+        (proc_progress.clone(), proc_pb.clone()),
+        (downloader.progress(), dl_pb.clone())
+    ]).await;
 
     let map = range_cache.versions.read().await;
 
+    proc_progress.files.inc_total(map.len() as u64);
+
     for (package, ranges) in map.iter() {
-        let pkg_o = match get_package_metadata(opts, package).await {
+        proc_progress.update_for_files(&proc_pb);
+        buf.clear();
+        let idx = match read_package_idx(opts, buf, package).await {
             Ok(v) => v,
             Err(e) => {
-                log(format!("will not fetch packages for {package}: {e}"));
-                continue
-            },
-        };
-
-        let Some(Some(versions)) = pkg_o.get("versions").map(Value::as_object) else {
-            log(format!("{package} does not have a versions object"));
-            continue
-        };
-
-        for version_key in versions.keys() {
-            let version = match Version::from_str(&version_key) {
-                Ok(v) => v,
-                Err(e) => {
-                    log(format!("invalid version in {package}: {e}"));
-                    continue
+                // we don't particularly care if we can't read the idx file. probably just means that there is no such
+                // package and the metadata was not downloaded. happens plenty of times during greedy runs, no biggie.
+                if opts.verbose {
+                    log(format!("unable to read idx for {package}: {e}"));
                 }
-            };
 
-            if !ranges.satisfies(&version) {
+                proc_progress.files.inc_failed(1);
+                
                 continue
             }
-
-            let Some(Some(version_o)) = versions.get(version_key).map(Value::as_object) else {
-                log(format!("{package}:{version_key} does not exist"));
-                continue
-            };
-
-            let Some(Some(dist)) = version_o.get("dist").map(Value::as_object) else {
-                log(format!("{package}:{version_key} does not have a dist object"));
-                continue
-            };
-
-            let Some(Some(url)) = dist.get("tarball").map(Value::as_str) else {
-                log(format!("{package}:{version_key} does not have a tarball field"));
-                continue
-            };
-
-            downloader.queue(
-                Download::versioned_package(opts, package, url.to_string())
-            ).await?;
-
-            downloader.progress().update_for_files(&mut progress_bar);
+        };
+        
+        if opts.greedy {
+            for version in idx.versions.iter().filter(|v| ranges.satisfies(v)) {
+                let Some(tarball_url) = idx.tarball_by_version(version) else {
+                    continue
+                };
+    
+                downloader.queue(Download::tarball(opts, package, tarball_url)).await?;
+            }
+        } else {
+            for version in ranges.max_satisfying(&idx.versions) {
+                let Some(tarball_url) = idx.tarball_by_version(version) else {
+                    continue
+                };
+    
+                downloader.queue(Download::tarball(opts, package, tarball_url)).await?;
+            }
         }
-    }
 
-    downloader.progress().wait_for_completion(&mut progress_bar).await;
+        proc_progress.files.inc_success(1);
+        
+    }
+    
+    downloader.progress().wait_for_completion(&dl_pb).await;
 
     Ok(MirrorResult {
         new_packages: downloader.progress().files.success(),
@@ -107,142 +111,148 @@ async fn download_packages(opts: &CliOpts, downloader: &Downloader, range_cache:
     })
 }
 
-async fn download_child_metadata(opts: &CliOpts, downloader: &Downloader, range_cache: &PackageRangeCache) -> Result<(), ErrorKind> {
-    let mut progress_bar = downloader.progress().create_download_progress_bar().await;
+async fn spawn_updater(progress_pairs: Vec<(Progress, ProgressBar)>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            for (progress, pb) in &progress_pairs {
+                progress.update_for_files(pb);
+            }
+    
+            sleep(Duration::from_millis(100)).await
+        }
+    })
+}
 
-    let mut visited = HashSet::<(String, String)>::new();
+async fn download_child_metadata(buf: &mut Vec<u8>, opts: &CliOpts, downloader: &Downloader, range_cache: &PackageRangeCache) -> Result<(), ErrorKind> {
+    let proc_progress = Progress::with_step("Resolving");
 
-    let mut packages: Vec<String> = range_cache.versions.read().await
+    let multibar = MultiProgress::new();
+    let proc_pb = multibar.add(proc_progress.create_processing_progress_bar().await);
+    let dl_pb = multibar.add(downloader.progress().create_download_progress_bar().await);
+
+    let _updater = spawn_updater(vec![
+        (proc_progress.clone(), proc_pb.clone()),
+        (downloader.progress(), dl_pb.clone())
+    ]).await;
+
+    let mut visited = HashSet::<(CompactString, Version)>::new();
+
+    let mut packages: Vec<CompactString> = range_cache.versions.read().await
         .keys()
-        .map(|v| v.clone())
+        .cloned()
         .collect();
+
+    proc_progress.files.inc_total(packages.len() as u64);
 
     let mut new_packages = Vec::new();
 
     while let Some(package) = packages.pop() {
-        let path = local_metadata_path(opts, &package);
+        proc_progress.files.inc_success(1);
 
-        let Ok(s) = tokio::fs::read_to_string(&path).await else {
-            log(format!("unable to read {}", path.to_string_lossy()));
-            continue
-        };
+        buf.clear();
+        let idx = match read_package_idx(opts, buf, &package).await {
+            Ok(v) => v,
+            Err(e) => {
+                if opts.verbose {
+                    log(format!("unable to read idx for {package}: {e}"));
+                }
 
-        let o: Value = serde_json::from_str(&s)?;
+                range_cache.remove(&package).await;
 
-        let Some(Some(versions)) = o.get("versions").map(Value::as_object) else {
-            log(format!("{} does not have a versions object", path.to_string_lossy()));
-            continue
-        };
-
-        for version_key in versions.keys() {
-            if !visited.insert((package.clone(), version_key.clone())) {
                 continue
             }
+        };
 
-            let version = match Version::from_str(&version_key) {
-                Ok(v) => v,
-                Err(e) => {
-                    log(format!("invalid version in {package}: {e}"));
+        if opts.greedy {
+            for version in &idx.versions {
+                let pkg_v = (package.clone(), version.clone());
+                if visited.contains(&pkg_v) {
+                    continue 
+                }
+    
+                visited.insert(pkg_v);
+    
+                if !range_cache.satisifies(&package, version).await {
                     continue
                 }
-            };
-
-            if !range_cache.satisifies(&package, &version).await {
-                continue
+    
+                if let Some(deps) = idx.deps_by_version(version) {
+                    populate_child_deps(&idx, opts, deps, downloader, range_cache, &mut new_packages).await?;
+                }
             }
+        } else {
+            for version in range_cache.max_satisfying(&package, &idx.versions).await {
+                let pkg_v = (package.clone(), version.clone());
+                if visited.contains(&pkg_v) {
+                    continue 
+                }
+    
+                visited.insert(pkg_v);
 
-            let Some(Some(version_o)) = versions.get(version_key).map(Value::as_object) else {
-                log(format!("{}: version {version_key} is not an object", path.to_string_lossy()));
-                continue
-            };
-
-            if let Some(Some(deps)) = version_o.get("dependencies").map(Value::as_object) {
-                populate_child_deps(&package, opts, deps, downloader, range_cache, &mut new_packages).await?;
-            };
-
-            if let Some(Some(deps)) = version_o.get("devDependencies").map(Value::as_object) {
-                populate_child_deps(&package, opts, deps, downloader, range_cache, &mut new_packages).await?;
-            };
+                if let Some(deps) = idx.deps_by_version(version) {
+                    populate_child_deps(&idx, opts, deps, downloader, range_cache, &mut new_packages).await?;
+                }
+            }
         }
 
         if packages.is_empty() {
             mem::swap(&mut packages, &mut new_packages);
-            downloader.progress().wait_for_idle(&mut progress_bar).await;
+            downloader.progress().wait_for_idle(&dl_pb).await;
+
+            proc_progress.files.reset();
+            proc_progress.files.inc_total(packages.len() as u64);
         }
     }
 
-    progress_bar.finish_using_style();
+    dl_pb.finish_using_style();
     
     Ok(())
 }
 
-async fn populate_child_deps(package: &str, opts: &CliOpts, deps_o: &Map<String, Value>, downloader: &Downloader, range_cache: &PackageRangeCache, packages: &mut Vec<String>) -> Result<(), ErrorKind> {
-    for dep in deps_o.keys() {
-        if let Some(Some(range)) = deps_o.get(dep).map(Value::as_str) {
-            if range.trim().is_empty() {
-                continue
-            }
-
-            if range.starts_with("link:") {
-                continue
-            }
-
-            if range.starts_with("git") {
-                continue
-            }
-
-            if range.starts_with("gist") {
-                continue
-            }
-
-            if range.starts_with("workspace") {
-                continue
-            }
-
-            if range.starts_with("http") {
-                continue
-            }
-
-            if range.starts_with("file") {
-                continue
-            }
-
-            if range.starts_with(".") {
-                continue
-            }
-
-            if let Some(sub_package) = range.strip_prefix("npm:") {
-                // add subpackage to list here?
-                continue
-            }
-
-            let package_range = match Range::from_str(range) {
-                Ok(v) => v,
-                Err(e) => {
-                    log(format!("invalid dependency range {range} for {dep} in {package}: {e}"));
-                    continue
+async fn populate_child_deps(idx: &PackageIndex, opts: &CliOpts, deps: &Vec<IdxDep>, downloader: &Downloader, range_cache: &PackageRangeCache, packages: &mut Vec<CompactString>) -> Result<(), ErrorKind> {
+    for dep in deps {
+        match &dep.range {
+            IdxDepVersion::Tag(tag) => {
+                if let Some(version) = idx.version_by_tag(tag.as_str()) {
+                    let range = Range::parse(version.to_compact_string())?;
+                    process_version(opts, downloader, range_cache, &dep.package, &range, packages).await?;
                 }
-            };
-
-            let res = range_cache.insert(dep, &package_range).await;
-            
-            if res.package_is_new {
-                downloader.queue(Download::metadata(opts, dep)).await?;
-            }
-            
-            if res.package_is_new || res.range_is_new {
-                if !packages.contains(dep) {
-                    packages.push(dep.clone());
-                } 
-            }
+            },
+            IdxDepVersion::Range(range) => {
+                process_version(opts, downloader, range_cache, &dep.package, range, packages).await?;
+            },
+            IdxDepVersion::SubDep(sub_dep) => {
+                process_version(opts, downloader, range_cache, &sub_dep.package, &sub_dep.range, packages).await?;
+            },
+            _ => (),
         }
+    }
+
+    Ok(())
+}
+
+async fn process_version(opts: &CliOpts, downloader: &Downloader, range_cache: &PackageRangeCache, dep: &str, version_range: &Range, packages: &mut Vec<CompactString>) -> Result<(), ErrorKind> {
+    let res = range_cache.insert(dep, version_range).await;
+            
+    if res.package_is_new {
+        downloader.queue(Download::metadata(opts, dep)).await?;
+    }
+    
+    if (res.package_is_new || res.range_is_new) && !packages.iter().any(|v| v == dep) {
+        packages.push(dep.to_compact_string());
     }
 
     Ok(())
 }
 
 async fn download_metadata(opts: &CliOpts, downloader: &Downloader, range_cache: &PackageRangeCache) -> Result<(), ErrorKind> {
-    let mut dl_progress_bar = downloader.progress().create_download_progress_bar().await;
+    let mut dl_pb = downloader.progress().create_download_progress_bar().await;
+
+    let _updater = spawn_updater(vec![
+        (downloader.progress(), dl_pb.clone())
+    ]).await;
+
+    _updater.abort();
 
     for entry in WalkDir::new(&opts.manifests_path) {
         let entry = entry?;
@@ -259,84 +269,12 @@ async fn download_metadata(opts: &CliOpts, downloader: &Downloader, range_cache:
             let res = range_cache.insert(&package, &version_range).await;
 
             if res.package_is_new {
-                downloader.queue(Download::metadata(&opts, &package)).await?;
+                downloader.queue(Download::metadata(opts, &package)).await?;
             }
         }
     }
 
-    downloader.progress().wait_for_completion(&mut dl_progress_bar).await;
+    downloader.progress().wait_for_completion(&mut dl_pb).await;
 
     Ok(())
 }
-
-async fn get_package_metadata(opts: &CliOpts, package: &str) -> Result<Value, ErrorKind> {
-    
-    let path = local_metadata_path(opts, &package);
-
-    let s = tokio::fs::read_to_string(&path).await?;
-
-    serde_json::from_str(&s).map_err(ErrorKind::from)
-}
-
-#[derive(Default)]
-pub struct PackageRangeCache {
-    pub versions: Arc<RwLock<HashMap<String, Ranges>>>,
-}
-
-pub struct Ranges {
-    pub inner: Vec<Range>,
-}
-
-impl Ranges {
-    pub fn satisfies(&self, version: &Version) -> bool {
-        for range in &self.inner {
-            if range.satisfies(version) {
-                return true
-            }
-        }
-
-        false
-    }
-}
-
-impl PackageRangeCache {
-    pub async fn satisifies(&self, package: &str, version: &Version) -> bool {
-        let map = self.versions.read().await;
-
-        if let Some(ranges) = map.get(package) {
-            return ranges.satisfies(version)
-        }
-
-        false
-    }
-
-    pub async fn insert(&self, package: &str, new_range: &Range) -> RangeCacheResult {
-        {
-            let map = self.versions.read().await;
-
-            if let Some(ranges) = map.get(package) {
-                for range in &ranges.inner {
-                    if new_range.allows_all(range) {
-                        return RangeCacheResult { package_is_new: false, range_is_new: false }
-                    }
-                }
-            }
-        }
-
-        {
-            let mut map = self.versions.write().await;
-
-            let new_range = new_range.clone();
-
-            if let Some(ranges) = map.get_mut(package) {
-                ranges.inner.push(new_range);
-                RangeCacheResult { package_is_new: false, range_is_new: true }
-            } else {
-                map.insert(package.to_owned(), Ranges { inner: vec![new_range] });
-                RangeCacheResult { package_is_new: true, range_is_new: true }
-            }
-        }
-    }
-}
-
-pub struct RangeCacheResult { pub package_is_new: bool, pub range_is_new: bool }

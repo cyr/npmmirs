@@ -1,6 +1,6 @@
 use std::{fmt::Display, sync::{atomic::{AtomicU64, AtomicU8, Ordering}, Arc}, time::Duration};
 
-use compact_str::ToCompactString;
+use compact_str::{CompactString, ToCompactString};
 use console::{style, pad_str};
 use indicatif::{ProgressBar, ProgressStyle, ProgressFinish, HumanBytes};
 use tokio::{sync::Mutex, time::sleep};
@@ -8,7 +8,7 @@ use tokio::{sync::Mutex, time::sleep};
 #[derive(Clone, Default)]
 pub struct Progress {
     pub step: Arc<AtomicU8>,
-    step_name: Arc<Mutex<String>>,
+    step_name: Arc<Mutex<CompactString>>,
     pub files: ProgressPart,
     pub bytes: ProgressPart,
     pub total_bytes: Arc<AtomicU64>,
@@ -18,7 +18,7 @@ pub struct Progress {
 impl Progress {
     pub fn new() -> Self {
         Self {
-            step_name: Arc::new(Mutex::new(String::new())),
+            step_name: Arc::new(Mutex::new(CompactString::new(""))),
             step: Arc::new(AtomicU8::new(0)),
             files: ProgressPart::new(),
             bytes: ProgressPart::new(),
@@ -27,27 +27,15 @@ impl Progress {
         }
     }
 
-    pub fn new_with_step(step: u8, step_name: &str) -> Self {
+    pub fn with_step(step: &str) -> Self {
         Self {
-            step_name: Arc::new(Mutex::new(step_name.to_string())),
-            step: Arc::new(AtomicU8::new(step)),
+            step_name: Arc::new(Mutex::new(step.to_compact_string())),
+            step: Arc::new(AtomicU8::new(0)),
             files: ProgressPart::new(),
             bytes: ProgressPart::new(),
             total_bytes: Arc::new(AtomicU64::new(0)),
             total_steps: Arc::new(AtomicU8::new(4))
         }
-    }
-
-    pub async fn create_prefix_stepless(&self) -> String {
-        pad_str(
-            &style(format!(
-                "{}", 
-                self.step_name.lock().await)
-            ).bold().to_string(), 
-            26, 
-            console::Alignment::Right, 
-            None
-        ).to_string()
     }
 
     pub async fn create_prefix(&self) -> String {
@@ -56,10 +44,22 @@ impl Progress {
                 "[{}/{}] {}", 
                 self.step.load(Ordering::SeqCst),
                 self.total_steps.load(Ordering::SeqCst), 
-                self.step_name.lock().await)
-            ).bold().to_string(), 
-            26, 
+                pad_str(self.step_name.lock().await.as_str(), 14, console::Alignment::Right, None)
+            )).bold().to_string(), 
+            20, 
             console::Alignment::Left, 
+            None
+        ).to_string()
+    }
+
+    pub async fn create_prefix_stepless(&self) -> String {
+        pad_str(
+            &style(format!(
+                "{}", 
+                pad_str(self.step_name.lock().await.as_str(), 14, console::Alignment::Right, None)
+            )).bold().to_string(), 
+            20, 
+            console::Alignment::Right, 
             None
         ).to_string()
     }
@@ -71,7 +71,7 @@ impl Progress {
             .with_style(
                 ProgressStyle::default_bar()
                     .template(
-                        "{prefix} [{wide_bar:.green/dim}] [{percent}%]",
+                        "{prefix} [{wide_bar:.green/dim}] {pos}/{len}",
                     )
                     .expect("template string should follow the syntax")
                     .progress_chars("###"),
@@ -97,63 +97,10 @@ impl Progress {
             .with_prefix(prefix)
     }
 
-    pub async fn create_unbounded_progress_bar(&self) -> ProgressBar {
-        let prefix = self.create_prefix().await;
-
-        ProgressBar::new(self.files.total())
-            .with_style(
-                ProgressStyle::default_bar()
-                    .template(
-                        "{prefix} [{elapsed_precise}] {pos}/{len} [{msg}]",
-                    )
-                    .expect("template string should follow the syntax")
-                    .progress_chars("###"),
-                    
-            )
-            .with_finish(ProgressFinish::AndLeave)
-            .with_prefix(prefix)
-    }
-
-    pub async fn create_count_progress_bar(&self) -> ProgressBar {
-        let prefix = self.create_prefix().await;
-
-        ProgressBar::new(self.files.total())
-            .with_style(
-                ProgressStyle::default_bar()
-                    .template(
-                        "{prefix} [{wide_bar:.cyan/dim}] [{elapsed_precise}] [{msg}]",
-                    )
-                    .expect("template string should follow the syntax")
-                    .progress_chars("###"),
-                    
-            )
-            .with_finish(ProgressFinish::AndLeave)
-            .with_prefix(prefix)
-    }
-
-    pub fn update_for_count(&self, progress_bar: &mut ProgressBar) {
-        progress_bar.set_length(self.bytes.total());
-        progress_bar.set_position(self.bytes.success());
-        progress_bar.set_message(self.files.success().to_compact_string());
-    }
-
-    pub fn update_for_files(&self, progress_bar: &mut ProgressBar) {
+    pub fn update_for_files(&self, progress_bar: &ProgressBar) {
         progress_bar.set_length(self.files.total());
         progress_bar.set_position(self.files.total() - self.files.remaining());
         progress_bar.set_message(HumanBytes(self.bytes.success()).to_compact_string());
-    }
-
-    pub fn update_for_bytes(&self, progress_bar: &mut ProgressBar) {
-        progress_bar.set_length(self.bytes.total());
-        progress_bar.set_position(self.bytes.success());
-        progress_bar.set_message(HumanBytes(self.bytes.success()).to_compact_string());
-    }
-
-    pub fn reset(&self) {
-        self.bytes.reset();
-        self.files.reset();
-        self.step.store(0, Ordering::SeqCst);
-        self.total_steps.store(5, Ordering::SeqCst);
     }
 
     pub fn set_total_steps(&self, num_steps: u8) {
@@ -161,7 +108,7 @@ impl Progress {
     }
 
     pub async fn next_step(&self, step_name: &str) {
-        *self.step_name.lock().await = step_name.to_string();
+        *self.step_name.lock().await = step_name.to_compact_string();
 
         self.bytes.reset();
         self.files.reset();
@@ -169,7 +116,7 @@ impl Progress {
         self.step.fetch_add(1, Ordering::SeqCst);
     }
     
-    pub async fn wait_for_idle(&self, progress_bar: &mut ProgressBar)  {
+    pub async fn wait_for_idle(&self, progress_bar: &ProgressBar)  {
         while self.files.remaining() > 0 {
             self.update_for_files(progress_bar);
             sleep(Duration::from_millis(100)).await
@@ -178,7 +125,7 @@ impl Progress {
         self.update_for_files(progress_bar);
     }
 
-    pub async fn wait_for_completion(&self, progress_bar: &mut ProgressBar)  {
+    pub async fn wait_for_completion(&self, progress_bar: &ProgressBar)  {
         while self.files.remaining() > 0 {
             self.update_for_files(progress_bar);
             sleep(Duration::from_millis(100)).await
@@ -228,10 +175,6 @@ impl ProgressPart {
 
     pub fn inc_success(&self, count: u64) {
         self.success.fetch_add(count, Ordering::SeqCst);
-    }
-
-    pub fn set_success(&self, count: u64) {
-        self.success.store(count, Ordering::SeqCst)
     }
 
     pub fn inc_skipped(&self, count: u64) {

@@ -1,11 +1,12 @@
 [package]
 name = "npmmirs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
 ahash = { version = "0.8.11", features = ["serde"] }
 async-channel = "2.3.1"
+bitcode = { version = "0.6.6", features = ["serde", "derive"] }
 chrono = "0.4.40"
 clap = { version = "4.5.32", features = ["env", "derive", "cargo"] }
 compact_str = { version = "0.9.0", features = ["serde"] }
@@ -22,6 +23,7 @@ thiserror = "2.0.12"
 tokio = { version = "1.44.1", features = ["macros", "rt-multi-thread", "fs"] }
 urlencoding = "2.1.3"
 walkdir = "2.5.0"
+zstd = "0.13.3"
 
 [profile.release]
 codegen-units = 1

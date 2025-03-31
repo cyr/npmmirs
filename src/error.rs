@@ -9,13 +9,13 @@ pub type Result<T> = std::result::Result<T, ErrorKind>;
 #[derive(Error, Debug)]
 pub enum NpmError {
     #[error("downloading main dependencies failed: {}", .0)]
-    DownloadingDependencies(ErrorKind),
+    Dependencies(ErrorKind),
 
     #[error("downloading child dependencies failed: {}", .0)]
-    DownloadingChildDependencies(ErrorKind),
+    ChildDependencies(ErrorKind),
     
     #[error("downloading packages failed: {}", .0)]
-    DownloadingPackages(ErrorKind),
+    Packages(ErrorKind),
 
 }
 
@@ -24,7 +24,7 @@ pub enum ErrorKind {
     #[error("async channel send error: {}", .0)]
     AsyncChannelSend(#[from]async_channel::SendError<Download>),
 
-    #[error("failed downloading {url}: {status_code}")]
+    #[error("failed downloading {}: {status_code}", .url)]
     Download { url: String, status_code: StatusCode },
 
     #[error("")]
@@ -48,6 +48,12 @@ pub enum ErrorKind {
     #[error("unable to probe manifest path: {}", .0)]
     Walkdir(#[from]walkdir::Error),
 
-    #[error("deserializing failed: {}", .0)]
+    #[error("json serialization failed: {}", .0)]
     Serde(#[from]serde_json::Error),
+
+    #[error("bitcode serialization failed: {}", .0)]
+    Bitcode(#[from]bitcode::Error),
+
+    #[error("semver parse error: {}", .0)]
+    SemVer(#[from]nodejs_semver::SemverError),
 }
