@@ -3,7 +3,9 @@ use std::{fmt::Display, process::exit, sync::Arc};
 
 use clap::{command, arg, Parser};
 use downloader::Downloader;
+use meta_cache::MetaCache;
 use mirror::mirror;
+use tokio::sync::RwLock;
 
 mod downloader;
 mod error;
@@ -12,6 +14,7 @@ mod checksum;
 mod mirror;
 mod metadata;
 mod range_cache;
+mod meta_cache;
 
 #[tokio::main]
 async fn main() {
@@ -19,10 +22,11 @@ async fn main() {
 
     let opts = CliOpts::parse();
 
-    let downloader = Downloader::build(&opts);
+    let meta_cache = Arc::new(RwLock::new(MetaCache::default()));
+    let downloader = Downloader::build(&opts, meta_cache.clone());
 
     log("Mirroring started");
-    match mirror(&opts, downloader).await {
+    match mirror(&opts, downloader, &meta_cache).await {
         Ok(res) => {
             log(format!("Mirroring completed: {res}"));
             exit(0)

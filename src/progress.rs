@@ -44,9 +44,9 @@ impl Progress {
                 "[{}/{}] {}", 
                 self.step.load(Ordering::SeqCst),
                 self.total_steps.load(Ordering::SeqCst), 
-                pad_str(self.step_name.lock().await.as_str(), 14, console::Alignment::Right, None)
+                pad_str(self.step_name.lock().await.as_str(), 17, console::Alignment::Right, None)
             )).bold().to_string(), 
-            20, 
+            23, 
             console::Alignment::Left, 
             None
         ).to_string()
@@ -58,7 +58,7 @@ impl Progress {
                 "{}", 
                 pad_str(self.step_name.lock().await.as_str(), 14, console::Alignment::Right, None)
             )).bold().to_string(), 
-            20, 
+            23, 
             console::Alignment::Right, 
             None
         ).to_string()
@@ -97,14 +97,22 @@ impl Progress {
             .with_prefix(prefix)
     }
 
-    pub fn update_for_files(&self, progress_bar: &ProgressBar) {
+    pub async fn update_for_files(&self, progress_bar: &ProgressBar) {
         progress_bar.set_length(self.files.total());
         progress_bar.set_position(self.files.total() - self.files.remaining());
         progress_bar.set_message(HumanBytes(self.bytes.success()).to_compact_string());
+
+        if self.step.load(Ordering::SeqCst) == 0 {
+            progress_bar.set_prefix(self.create_prefix_stepless().await);
+        }
     }
 
     pub fn set_total_steps(&self, num_steps: u8) {
         self.total_steps.store(num_steps, Ordering::SeqCst);
+    }
+
+    pub async fn set_step(&self, step_name: &str) {
+        *self.step_name.lock().await = step_name.to_compact_string();
     }
 
     pub async fn next_step(&self, step_name: &str) {
@@ -118,22 +126,22 @@ impl Progress {
     
     pub async fn wait_for_idle(&self, progress_bar: &ProgressBar)  {
         while self.files.remaining() > 0 {
-            self.update_for_files(progress_bar);
+            self.update_for_files(progress_bar).await;
             sleep(Duration::from_millis(100)).await
         }
 
-        self.update_for_files(progress_bar);
+        self.update_for_files(progress_bar).await;
     }
 
     pub async fn wait_for_completion(&self, progress_bar: &ProgressBar)  {
         while self.files.remaining() > 0 {
-            self.update_for_files(progress_bar);
+            self.update_for_files(progress_bar).await;
             sleep(Duration::from_millis(100)).await
         }
 
         self.total_bytes.fetch_add(self.bytes.success(), Ordering::SeqCst);
 
-        self.update_for_files(progress_bar);
+        self.update_for_files(progress_bar).await;
 
         progress_bar.finish_using_style();
     }

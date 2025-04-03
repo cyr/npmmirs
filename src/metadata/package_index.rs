@@ -3,9 +3,9 @@ use std::{collections::BTreeMap, path::Path};
 use compact_str::{CompactString, ToCompactString};
 use nodejs_semver::{Range, Version};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::RwLock};
 
-use crate::{error::ErrorKind, CliOpts};
+use crate::{error::ErrorKind, meta_cache::MetaCache, CliOpts};
 
 use super::{local_metadata_idx_path, sparse_metadata::{DepVersion, SparseMetadata, SubDep, VersionInfo}};
 
@@ -159,38 +159,32 @@ fn strip_path(v: &str, package: &str, registry_url: &str) -> TarballUrl {
     }).unwrap_or_else(|| TarballUrl::Full(v.to_string()))
 }
 
-pub async fn write_package_idx(target_path: &Path, pkg_idx: PackageIndex) -> Result<(), ErrorKind> {
+pub async fn write_package_idx(buf: &mut Vec<u8>, package: &str, target_path: &Path, pkg_idx: PackageIndex, meta_cache: &RwLock<MetaCache>) -> Result<(), ErrorKind> {
     let idx_path = target_path.parent().unwrap().join("index.json.idx");
     let idx_data = bitcode::serialize(&pkg_idx)?;
 
     let uncompressed_len = idx_data.len() as u64;
-
     let compressed = zstd::encode_all(&idx_data[..], 3)?;
+
+    buf.clear();
+    buf.write_u64(uncompressed_len).await?;
+    buf.write_all(&compressed[..]).await?;
+
+    meta_cache.write().await.insert(package, &buf[..]);
 
     let mut file = tokio::fs::File::create(&idx_path).await?;
 
-    file.write_u64(uncompressed_len).await?;
-    file.write_all(&compressed).await?;
+    file.write_all(buf).await?;
 
     Ok(())
 }
 
-pub async fn read_package_idx(opts: &CliOpts, buf: &mut Vec<u8>, package: &str) -> Result<PackageIndex, ErrorKind> {
+pub async fn read_package_idx(opts: &CliOpts, buf: &mut Vec<u8>, package: &str) -> Result<usize, ErrorKind> {
     let mut idx_file = tokio::fs::File::open(&local_metadata_idx_path(opts, package)).await?;
 
     let idx_len = idx_file.metadata().await?.len() as usize;
     
     buf.reserve_exact(idx_len);
 
-    let uncompressed_len = idx_file.read_u64().await? as usize;
-    
-    let len = idx_file.read_to_end(buf).await?;
-
-    buf.resize_with(len + uncompressed_len, || 0u8);
-
-    let (compressed_buf, decompressed_buf) = buf.split_at_mut(len);
-
-    zstd::stream::copy_decode(&compressed_buf[..], &mut decompressed_buf[..])?;
-
-    Ok(bitcode::deserialize(decompressed_buf)?)
+    idx_file.read_to_end(buf).await.map_err(ErrorKind::from)
 }
