@@ -4,7 +4,7 @@
 
 Note that **npmmirs** does not attempt to do a minimal-complete mirror of the seed packages in your package.json files. It will do a complete resolution of all dependencies and child-dependencies, which typically will result in quite a large (but complete!) tree of dependencies. You can optionally not mirror dev-dependencies, peer-dependencies and optional-dependencies via the appropriate switch.
 
-However, any non-npm dependency will not be pulled down - such as git-repository data or http(/)s paths.
+However, any non-npm dependency will not be pulled down - such as git-repository data or http(s) paths.
 
 ## Usage
 
