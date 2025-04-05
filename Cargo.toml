@@ -15,7 +15,7 @@ dotenv = "0.15.0"
 hex = "0.4.3"
 indicatif = "0.17.11"
 nodejs-semver = { version = "4.1.0", features = ["serde"] }
-reqwest = "0.12.15"
+reqwest = { version = "0.12.15", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots", "zstd"] }
 serde = "1.0.219"
 serde_json = "1.0.140"
 sha2 = "0.10.8"
