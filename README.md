@@ -26,7 +26,7 @@ Note that tarball-paths are not rewritten in the metadata file, so they will be 
 
 ## Example nginx.conf
 
-```
+```nginx
 server {
     listen 443;
     server_name registry.npmjs.org;
